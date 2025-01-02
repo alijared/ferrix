@@ -94,15 +94,15 @@ where
                     Some(event) => {
                         debug!("Received a watch event");
 
-                        let (routes, deleted) = match event {
+                        let routes= match event {
                             Event::Deleted(route) => {
-                                (vec![route], true)
+                                vec![route]
                             }
                             Event::Applied(route) => {
-                                (vec![route], false)
+                                vec![route]
                             }
                             Event::Restarted(routes) => {
-                                (routes, false)
+                                routes
                             }
                         };
 

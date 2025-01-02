@@ -2,6 +2,7 @@ use kube::Resource;
 use serde::de::DeserializeOwned;
 use std::fmt::Debug;
 
+pub mod endpoints;
 pub mod watcher;
 
 pub trait Object: Resource + Clone + DeserializeOwned + Debug + Send + 'static {}

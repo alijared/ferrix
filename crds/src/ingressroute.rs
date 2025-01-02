@@ -31,5 +31,6 @@ pub struct IngressRouteRule {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct IngressRouteService {
     pub name: String,
+    pub namespace: Option<String>,
     pub port: u16,
 }

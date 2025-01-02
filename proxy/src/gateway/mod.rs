@@ -1,14 +1,20 @@
+use crate::k8s;
 use crate::load_balancer::RoundRobinLoadBalancer;
+use anyhow::anyhow;
 use async_trait::async_trait;
 use crds::IngressRoute;
 use dashmap::DashMap;
 use futures_util::future::BoxFuture;
-use kube::Resource;
-use log::info;
+use k8s_openapi::api::core::v1::Endpoints;
+use kube::runtime::watcher;
+use kube::runtime::watcher::Event;
+use kube::{Api, Resource};
+use log::{debug, error};
 use pingora::http::StatusCode;
 use pingora::prelude::{HttpPeer, Session};
 use pingora::proxy::ProxyHttp;
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 #[derive(Clone)]
 pub struct SharedGateway(Arc<Gateway>);
@@ -47,12 +53,14 @@ impl ProxyHttp for SharedGateway {
 
 pub struct Gateway {
     route_table: Arc<DashMap<String, RoundRobinLoadBalancer>>,
+    managed_objects: Arc<DashMap<String, (String, Arc<Notify>)>>,
 }
 
 impl Gateway {
     pub fn new() -> Self {
         Self {
             route_table: Arc::new(DashMap::new()),
+            managed_objects: Arc::new(DashMap::new()),
         }
     }
 
@@ -63,41 +71,130 @@ impl Gateway {
            + Sync
            + 'static {
         let route_table = self.route_table.clone();
+        let managed_objects = self.managed_objects.clone();
         move |k8s_client, route| {
             Box::pin({
-                let route_meta = route.meta();
+                let route_meta = route.meta().clone();
+                let route_id = route_meta.uid.clone().unwrap();
                 let host = route.spec.route.host.clone();
-
                 let route_table = route_table.clone();
-                async move {
-                    let lb = RoundRobinLoadBalancer::try_from_iter(
-                        "crumble.svc.cluster.local",
-                        ["127.0.0.1:8083"],
-                    )?;
+                let managed_objects = managed_objects.clone();
+                let route = route.clone();
 
-                    route_table
-                        .entry(host.clone())
-                        .and_modify(|existing_lb| {
-                            info!(
-                                "Updating IngressRoute '{}' in the {} namespace",
-                                route_meta.clone().name.unwrap(),
-                                route_meta.clone().namespace.unwrap()
-                            );
-                            *existing_lb = lb.clone();
-                        })
-                        .or_insert_with(|| {
-                            info!(
-                                "New IngressRoute '{}' added in the {} namespace",
-                                route_meta.clone().name.unwrap(),
-                                route_meta.clone().namespace.unwrap()
-                            );
-                            lb
-                        });
+                async move {
+                    if route_meta.deletion_timestamp.is_some() {
+                        Self::delete_route(&host, route_table.clone(), managed_objects.clone());
+                        return Ok(());
+                    }
+
+                    let notify = Arc::new(Notify::new());
+                    let (sni, ips) = Self::get_endpoints_from_route(
+                        k8s_client,
+                        route,
+                        notify.clone(),
+                        route_table.clone(),
+                    )
+                    .await
+                    .map_err(|e| anyhow!("unable to get endpoints for new service: {}", e))?;
+                    let lb = RoundRobinLoadBalancer::try_from_iter(&sni, ips)?;
+
+                    if let Some((object_host, notify)) =
+                        managed_objects.get(&host).map(|v| v.clone())
+                    {
+                        if object_host == host {
+                            route_table.alter(&object_host, |_, _| lb);
+                            return Ok(());
+                        }
+
+                        Self::delete_route(
+                            &object_host,
+                            route_table.clone(),
+                            managed_objects.clone(),
+                        );
+                        route_table.insert(host.clone(), lb);
+                        managed_objects.alter(&route_id, |_, _| (host, notify));
+                    } else {
+                        route_table.insert(host.clone(), lb);
+                        managed_objects.insert(route_id, (host, notify));
+                    }
 
                     Ok(())
                 }
             })
         }
+    }
+
+    fn delete_route(
+        host: &str,
+        route_table: Arc<DashMap<String, RoundRobinLoadBalancer>>,
+        managed_objects: Arc<DashMap<String, (String, Arc<Notify>)>>,
+    ) {
+        let notify = managed_objects.get(host).map(|v| v.clone().1).unwrap();
+        notify.notify_one();
+
+        route_table.remove(host);
+        managed_objects.remove(host);
+    }
+
+    async fn get_endpoints_from_route(
+        client: kube::Client,
+        route: IngressRoute,
+        notify: Arc<Notify>,
+        route_table: Arc<DashMap<String, RoundRobinLoadBalancer>>,
+    ) -> Result<(String, Vec<String>), kube::Error> {
+        let backup_namespace = route.meta().namespace.clone().unwrap();
+        let service = route.spec.route.rules[0].service.clone();
+        let namespace = service.namespace.clone().unwrap_or(backup_namespace);
+        let api = Api::<Endpoints>::namespaced(client.clone(), &namespace);
+        let ep = api.get(&service.name).await?;
+
+        let sni = format!("{}.{}.svc.cluster.local", service.name, namespace.clone());
+        let sni_clone = sni.clone();
+        let host = route.spec.route.host.clone();
+        tokio::spawn(async move {
+            let mut watch =
+                match k8s::watcher::create::<Endpoints>(client.clone(), watcher::Config::default())
+                    .await
+                {
+                    Ok(w) => w,
+                    Err(e) => {
+                        error!("Unable to create endpoints watcher: {}", e);
+                        return;
+                    }
+                };
+
+            loop {
+                tokio::select! {
+                    _ = notify.notified() => {
+                        break;
+                    }
+                    event = watch.recv() => match event {
+                        Some(event) => {
+                            let endpoints = match event {
+                                Event::Applied(e) => vec![e],
+                                Event::Deleted(_) => continue,
+                                Event::Restarted(e) => e
+                            };
+
+                            let ep = endpoints.last().unwrap();
+                            let ips = k8s::endpoints::get_ip_addresses(ep.clone(), service.port);
+
+                            match RoundRobinLoadBalancer::try_from_iter(&sni_clone, ips) {
+                                Ok(lb) => {
+                                    debug!("Load balancer updated with new endpoint addresses");
+                                    route_table.alter(&host, |_, _| lb);
+                                }
+                                Err(e) => error!("Unable to update load balancer with new endpoints: {}", e),
+                            }
+                        }
+                        None => continue
+                    }
+                }
+            }
+        });
+
+        let ips = k8s::endpoints::get_ip_addresses(ep, service.port);
+        Ok((sni, ips))
     }
 }
 
