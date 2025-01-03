@@ -2,6 +2,7 @@ use crate::k8s;
 use crate::load_balancer::RoundRobinLoadBalancer;
 use anyhow::anyhow;
 use async_trait::async_trait;
+use axum::http::header::HOST;
 use crds::IngressRoute;
 use dashmap::DashMap;
 use futures_util::future::BoxFuture;
@@ -9,23 +10,24 @@ use k8s_openapi::api::core::v1::Endpoints;
 use kube::runtime::watcher;
 use kube::runtime::watcher::Event;
 use kube::{Api, Resource};
-use log::{debug, error, info};
+use log::{debug, error};
 use pingora::http::StatusCode;
 use pingora::prelude::{HttpPeer, Session};
 use pingora::proxy::ProxyHttp;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
 #[derive(Clone)]
 pub struct SharedGateway(Arc<Gateway>);
 
+pub type RouteTable = Arc<DashMap<String, RoundRobinLoadBalancer>>;
+
 impl SharedGateway {
     pub fn new(gateway: Gateway) -> Self {
         Self(Arc::new(gateway))
     }
 
-    pub fn get_route_table(&self) -> Arc<DashMap<String, RoundRobinLoadBalancer>> {
+    pub fn get_route_table(&self) -> RouteTable {
         self.0.get_route_table()
     }
 }
@@ -48,7 +50,7 @@ impl ProxyHttp for SharedGateway {
 }
 
 pub struct Gateway {
-    route_table: Arc<DashMap<String, RoundRobinLoadBalancer>>,
+    route_table: RouteTable,
     managed_objects: Arc<DashMap<String, (String, Arc<Notify>)>>,
 }
 
@@ -60,7 +62,7 @@ impl Gateway {
         }
     }
 
-    pub fn get_route_table(&self) -> Arc<DashMap<String, RoundRobinLoadBalancer>> {
+    pub fn get_route_table(&self) -> RouteTable {
         self.route_table.clone()
     }
 
@@ -73,7 +75,10 @@ impl Gateway {
         move |k8s_client, route| {
             let route_tables = route_tables.clone();
             Box::pin(async move {
-                if let Some(gateway) = route_tables.get(&route.spec.entrypoint).map(|v| v.value().clone()) {
+                if let Some(gateway) = route_tables
+                    .get(&route.spec.entrypoint)
+                    .map(|v| v.value().clone())
+                {
                     return gateway.0.update_route_table(k8s_client, route).await;
                 }
 
@@ -125,7 +130,7 @@ impl Gateway {
 
     fn delete_route(
         host: &str,
-        route_table: Arc<DashMap<String, RoundRobinLoadBalancer>>,
+        route_table: RouteTable,
         managed_objects: Arc<DashMap<String, (String, Arc<Notify>)>>,
     ) {
         let notify = managed_objects.get(host).map(|v| v.clone().1).unwrap();
@@ -139,7 +144,7 @@ impl Gateway {
         client: kube::Client,
         route: IngressRoute,
         notify: Arc<Notify>,
-        route_table: Arc<DashMap<String, RoundRobinLoadBalancer>>,
+        route_table: RouteTable,
     ) -> Result<(String, Vec<String>), kube::Error> {
         let backup_namespace = route.meta().namespace.clone().unwrap();
         let service = route.spec.route.rules[0].service.clone();
@@ -212,7 +217,7 @@ impl ProxyHttp for Gateway {
         let host = session
             .req_header()
             .headers
-            .get("Host")
+            .get(HOST)
             .ok_or(pingora::Error::create(
                 pingora::ErrorType::InvalidHTTPHeader,
                 pingora::ErrorSource::Upstream,

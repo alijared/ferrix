@@ -11,6 +11,9 @@ codegen-units = 1
 opt-level = 3
 panic = "abort"
 overflow-checks = false
+strip = true
+debug = false
+incremental = false
 
 [workspace.dependencies]
 clap = { version = "4.5.23", features = ["derive"] }

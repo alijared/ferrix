@@ -2,7 +2,7 @@ mod handlers;
 mod router;
 mod schemas;
 
-use crate::load_balancer::RoundRobinLoadBalancer;
+use crate::gateway::RouteTable;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -14,14 +14,11 @@ use tokio::net::TcpListener;
 
 pub struct Service {
     port: u16,
-    route_tables: Arc<DashMap<String, Arc<DashMap<String, RoundRobinLoadBalancer>>>>,
+    route_tables: Arc<DashMap<String, RouteTable>>,
 }
 
 impl Service {
-    pub fn new(
-        port: u16,
-        route_tables: Arc<DashMap<String, Arc<DashMap<String, RoundRobinLoadBalancer>>>>,
-    ) -> Self {
+    pub fn new(port: u16, route_tables: Arc<DashMap<String, RouteTable>>) -> Self {
         Self { port, route_tables }
     }
 

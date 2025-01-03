@@ -2,12 +2,11 @@ use crate::gateway::{Gateway, SharedGateway};
 use anyhow::anyhow;
 use clap::Parser;
 use dashmap::DashMap;
-use log::{debug, error, info};
+use log::{error, info};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use pingora::prelude::background_service;
 use pingora::proxy::http_proxy_service;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -56,8 +55,8 @@ fn run(args: CliArgs) -> Result<(), anyhow::Error> {
 
     server.bootstrap();
 
-    let mut entry_points = DashMap::with_capacity(config.entry_points.len());
-    let mut route_tables = DashMap::with_capacity(config.entry_points.len());
+    let entry_points = DashMap::with_capacity(config.entry_points.len());
+    let route_tables = DashMap::with_capacity(config.entry_points.len());
     for ep in config.entry_points {
         let gateway = SharedGateway::new(Gateway::new());
         route_tables.insert(ep.name.clone(), gateway.get_route_table());
