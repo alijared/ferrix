@@ -1,5 +1,5 @@
 use crate::api::schemas;
-use crate::load_balancer::RoundRobinLoadBalancer;
+use crate::gateway::RouteTable;
 use axum::extract::State;
 use axum::Json;
 use dashmap::DashMap;
@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub async fn routes(
-    State(route_tables): State<Arc<DashMap<String, Arc<DashMap<String, RoundRobinLoadBalancer>>>>>,
+    State(route_tables): State<Arc<DashMap<String, RouteTable>>>,
 ) -> Json<HashMap<String, Vec<schemas::Route>>> {
     let mut routes = HashMap::with_capacity(route_tables.len());
     for table in route_tables.iter() {
