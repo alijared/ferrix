@@ -25,6 +25,19 @@ impl RoundRobinLoadBalancer {
             load_balancer: Arc::new(upstreams),
         })
     }
+
+    pub fn get_sni(&self) -> String {
+        self.sni.clone()
+    }
+
+    pub fn get_ip_addresses(self) -> Vec<String> {
+        let backends = self.load_balancer.backends();
+        backends
+            .get_backend()
+            .iter()
+            .map(|b| b.addr.to_string())
+            .collect()
+    }
 }
 
 #[async_trait]

@@ -1,13 +1,17 @@
 use crate::gateway::{Gateway, SharedGateway};
 use anyhow::anyhow;
 use clap::Parser;
-use log::error;
+use dashmap::DashMap;
+use log::{debug, error, info};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use pingora::prelude::background_service;
 use pingora::proxy::http_proxy_service;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::runtime::Runtime;
 
+mod api;
 mod gateway;
 mod k8s;
 mod load_balancer;
@@ -16,11 +20,22 @@ mod server;
 #[derive(Parser, Debug)]
 #[command(version, about = "I'm a turnip", long_about = None)]
 struct CliArgs {
-    #[arg(short, long, default_value = "/etc/ferrix/config.yaml")]
+    #[arg(
+        short,
+        long,
+        help = "Config file location",
+        default_value = "/etc/ferrix/config.yaml"
+    )]
     config_file: String,
 
-    #[arg(long, default_value_t = log::LevelFilter::Info)]
+    #[arg(long, help = "Application log level", default_value_t = log::LevelFilter::Info)]
     log_level: log::LevelFilter,
+
+    #[arg(long, help = "Enable HTTP API interface")]
+    api_enabled: bool,
+
+    #[arg(long, help = "Port to run the HTTP API", default_value_t = 8080)]
+    api_port: u16,
 }
 
 fn main() {
@@ -37,21 +52,37 @@ fn main() {
 fn run(args: CliArgs) -> Result<(), anyhow::Error> {
     let config = server::config::load(&args.config_file)?;
     let mut server = server::new(config.server);
-
     let (watch_failure_tx, mut watch_failure_rx) = tokio::sync::mpsc::channel(1);
 
-    let gateway = SharedGateway::new(Gateway::new());
-    let mut proxy = http_proxy_service(&server.configuration, gateway.clone());
-    proxy.add_tcp(format!("[::]:{}", config.entry_points[0].port).as_str());
-
     server.bootstrap();
-    server.add_services(vec![
-        Box::new(background_service(
-            "Kubernetes IngressRoute watcher",
-            k8s::watcher::Service::new(gateway.update_route_table(), watch_failure_tx),
-        )),
-        Box::new(proxy),
-    ]);
+
+    let mut entry_points = DashMap::with_capacity(config.entry_points.len());
+    let mut route_tables = DashMap::with_capacity(config.entry_points.len());
+    for ep in config.entry_points {
+        let gateway = SharedGateway::new(Gateway::new());
+        route_tables.insert(ep.name.clone(), gateway.get_route_table());
+        let mut proxy = http_proxy_service(&server.configuration, gateway.clone());
+
+        proxy.add_tcp(format!("[::]:{}", ep.port).as_str());
+        server.add_service(proxy);
+        entry_points.insert(ep.name.clone(), gateway.clone());
+    }
+
+    server.add_services(vec![Box::new(background_service(
+        "Kubernetes IngressRoute watcher",
+        k8s::watcher::Service::new(
+            Gateway::update_route_tables(Arc::new(entry_points)),
+            watch_failure_tx,
+        ),
+    ))]);
+
+    if args.api_enabled {
+        info!("Starting up HTTP API");
+        server.add_service(background_service(
+            "API",
+            api::Service::new(args.api_port, Arc::new(route_tables)),
+        ))
+    }
 
     let rt = Runtime::new().map_err(|e| anyhow!("Failed to create watch failure runtime {}", e))?;
     rt.spawn(async move {

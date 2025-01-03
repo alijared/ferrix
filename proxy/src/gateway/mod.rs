@@ -9,10 +9,11 @@ use k8s_openapi::api::core::v1::Endpoints;
 use kube::runtime::watcher;
 use kube::runtime::watcher::Event;
 use kube::{Api, Resource};
-use log::{debug, error};
+use log::{debug, error, info};
 use pingora::http::StatusCode;
 use pingora::prelude::{HttpPeer, Session};
 use pingora::proxy::ProxyHttp;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -24,13 +25,8 @@ impl SharedGateway {
         Self(Arc::new(gateway))
     }
 
-    pub fn update_route_table(
-        &self,
-    ) -> impl Fn(kube::client::Client, IngressRoute) -> BoxFuture<'static, Result<(), anyhow::Error>>
-           + Send
-           + Sync
-           + 'static {
-        self.0.update_route_table()
+    pub fn get_route_table(&self) -> Arc<DashMap<String, RoundRobinLoadBalancer>> {
+        self.0.get_route_table()
     }
 }
 
@@ -64,64 +60,67 @@ impl Gateway {
         }
     }
 
-    pub fn update_route_table(
-        &self,
+    pub fn get_route_table(&self) -> Arc<DashMap<String, RoundRobinLoadBalancer>> {
+        self.route_table.clone()
+    }
+
+    pub fn update_route_tables(
+        route_tables: Arc<DashMap<String, SharedGateway>>,
     ) -> impl Fn(kube::client::Client, IngressRoute) -> BoxFuture<'static, Result<(), anyhow::Error>>
            + Send
            + Sync
            + 'static {
-        let route_table = self.route_table.clone();
-        let managed_objects = self.managed_objects.clone();
         move |k8s_client, route| {
-            Box::pin({
-                let route_meta = route.meta().clone();
-                let route_id = route_meta.uid.clone().unwrap();
-                let host = route.spec.route.host.clone();
-                let route_table = route_table.clone();
-                let managed_objects = managed_objects.clone();
-                let route = route.clone();
-
-                async move {
-                    if route_meta.deletion_timestamp.is_some() {
-                        Self::delete_route(&host, route_table.clone(), managed_objects.clone());
-                        return Ok(());
-                    }
-
-                    let notify = Arc::new(Notify::new());
-                    let (sni, ips) = Self::get_endpoints_from_route(
-                        k8s_client,
-                        route,
-                        notify.clone(),
-                        route_table.clone(),
-                    )
-                    .await
-                    .map_err(|e| anyhow!("unable to get endpoints for new service: {}", e))?;
-                    let lb = RoundRobinLoadBalancer::try_from_iter(&sni, ips)?;
-
-                    if let Some((object_host, notify)) =
-                        managed_objects.get(&host).map(|v| v.clone())
-                    {
-                        if object_host == host {
-                            route_table.alter(&object_host, |_, _| lb);
-                            return Ok(());
-                        }
-
-                        Self::delete_route(
-                            &object_host,
-                            route_table.clone(),
-                            managed_objects.clone(),
-                        );
-                        route_table.insert(host.clone(), lb);
-                        managed_objects.alter(&route_id, |_, _| (host, notify));
-                    } else {
-                        route_table.insert(host.clone(), lb);
-                        managed_objects.insert(route_id, (host, notify));
-                    }
-
-                    Ok(())
+            let route_tables = route_tables.clone();
+            Box::pin(async move {
+                if let Some(gateway) = route_tables.get(&route.spec.entrypoint).map(|v| v.value().clone()) {
+                    return gateway.0.update_route_table(k8s_client, route).await;
                 }
+
+                Ok(())
             })
         }
+    }
+
+    async fn update_route_table(
+        &self,
+        k8s_client: kube::Client,
+        route: IngressRoute,
+    ) -> Result<(), anyhow::Error> {
+        let route_meta = route.meta().clone();
+        let route_id = route_meta.uid.clone().unwrap();
+        let host = route.spec.route.host.clone();
+        let route_table = self.route_table.clone();
+        let managed_objects = self.managed_objects.clone();
+        let route = route.clone();
+
+        if route_meta.deletion_timestamp.is_some() {
+            Self::delete_route(&host, route_table.clone(), managed_objects.clone());
+            return Ok(());
+        }
+
+        let notify = Arc::new(Notify::new());
+        let (sni, ips) =
+            Self::get_endpoints_from_route(k8s_client, route, notify.clone(), route_table.clone())
+                .await
+                .map_err(|e| anyhow!("unable to get endpoints for new service: {}", e))?;
+        let lb = RoundRobinLoadBalancer::try_from_iter(&sni, ips)?;
+
+        if let Some((object_host, notify)) = managed_objects.get(&host).map(|v| v.clone()) {
+            if object_host == host {
+                route_table.alter(&object_host, |_, _| lb);
+                return Ok(());
+            }
+
+            Self::delete_route(&object_host, route_table.clone(), managed_objects.clone());
+            route_table.insert(host.clone(), lb);
+            managed_objects.alter(&route_id, |_, _| (host, notify));
+        } else {
+            route_table.insert(host.clone(), lb);
+            managed_objects.insert(route_id, (host, notify));
+        }
+
+        Ok(())
     }
 
     fn delete_route(
@@ -152,10 +151,12 @@ impl Gateway {
         let sni_clone = sni.clone();
         let host = route.spec.route.host.clone();
         tokio::spawn(async move {
+            let watch_opts = watcher::Config {
+                field_selector: Some(format!("metadata.name={}", service.name)),
+                ..Default::default()
+            };
             let mut watch =
-                match k8s::watcher::create::<Endpoints>(client.clone(), watcher::Config::default())
-                    .await
-                {
+                match k8s::watcher::create::<Endpoints>(client.clone(), watch_opts).await {
                     Ok(w) => w,
                     Err(e) => {
                         error!("Unable to create endpoints watcher: {}", e);
@@ -178,7 +179,6 @@ impl Gateway {
 
                             let ep = endpoints.last().unwrap();
                             let ips = k8s::endpoints::get_ip_addresses(ep.clone(), service.port);
-
                             match RoundRobinLoadBalancer::try_from_iter(&sni_clone, ips) {
                                 Ok(lb) => {
                                     debug!("Load balancer updated with new endpoint addresses");

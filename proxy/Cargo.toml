@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.94"
-async-trait = "0.1.83"
+async-trait = "0.1.84"
+axum = "0.8.1"
 crds = { path = "../crds" }
 clap = { workspace = true, features = ["derive"] }
 dashmap = "6.1.0"
